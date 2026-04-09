@@ -51,7 +51,7 @@ ARCHITECTURE=$(grep "^CFNARCHITECTURE=" "$CONFIG_FILE" | cut -d'=' -f2)
 # Download kernel and fc
 if [ "$ARCHITECTURE" = "arm64" ]; then
     # Download kernel
-	curl -L https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/aarch64/vmlinux-$KERNEL_VERSION -o ${TEMP_DIR}/kernels/${KERNEL_FOLDER}/vmlinux.bin
+	curl -L https://github.com/eric-yq/ec2-test-suite/raw/refs/heads/main/misc/e2b-infra-arm-test/fc-kernels/6.1.102/arm64/vmlinux.bin -o ${TEMP_DIR}/kernels/${KERNEL_FOLDER}/vmlinux.bin
 	# Download firecracker
 	curl -L ${fc_url}/download/${FC_VERSION}/firecracker-${FC_VERSION}-aarch64.tgz | tar -xz
     mv release-${FC_VERSION}-aarch64/firecracker-${FC_VERSION}-aarch64 \
