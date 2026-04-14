@@ -2,20 +2,20 @@ package artifacts_registry
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	containerregistry "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/daemon"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
@@ -108,33 +108,55 @@ func PrepareBuildContext(
 		os.RemoveAll(contextDir)
 	}
 
-	// Download and extract COPY step files from S3
+	// Download and extract COPY step files from S3 in parallel
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
 	for _, step := range steps {
 		if strings.ToUpper(step.Type) != "COPY" || step.FilesHash == "" {
 			continue
 		}
+		wg.Add(1)
+		go func(s TemplateBuildStep) {
+			defer wg.Done()
 
-		s3Key := storage.BuildContextKey(templateID, step.FilesHash)
-		tarPath := filepath.Join(contextDir, fmt.Sprintf("%s.tar.gz", step.FilesHash))
+			s3Key := storage.BuildContextKey(templateID, s.FilesHash)
+			tarPath := filepath.Join(contextDir, fmt.Sprintf("%s.tar.gz", s.FilesHash))
 
-		zap.L().Info("Downloading build context file from S3",
-			zap.String("templateID", templateID),
-			zap.String("hash", step.FilesHash),
-			zap.String("s3Key", s3Key))
+			zap.L().Info("Downloading build context file from S3",
+				zap.String("templateID", templateID),
+				zap.String("hash", s.FilesHash),
+				zap.String("s3Key", s3Key))
 
-		if err := presignSvc.DownloadToFile(ctx, s3Key, tarPath); err != nil {
-			cleanup()
-			return "", nil, fmt.Errorf("failed to download build context file '%s': %w", s3Key, err)
-		}
+			if err := presignSvc.DownloadToFile(ctx, s3Key, tarPath); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to download build context file '%s': %w", s3Key, err)
+				}
+				mu.Unlock()
+				return
+			}
 
-		// Extract tar.gz into context directory
-		if err := extractTarGz(tarPath, contextDir); err != nil {
-			cleanup()
-			return "", nil, fmt.Errorf("failed to extract build context file '%s': %w", tarPath, err)
-		}
+			// Extract tar.gz into context directory
+			if err := extractTarGz(tarPath, contextDir); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to extract build context file '%s': %w", tarPath, err)
+				}
+				mu.Unlock()
+				return
+			}
 
-		// Remove the tar.gz after extraction
-		os.Remove(tarPath)
+			// Remove the tar.gz after extraction
+			os.Remove(tarPath)
+		}(step)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		cleanup()
+		return "", nil, firstErr
 	}
 
 	// Generate Dockerfile
@@ -180,38 +202,33 @@ func (g *AWSArtifactsRegistry) BuildAndPushImage(
 		zap.String("contextDir", contextDir),
 		zap.String("targetTag", targetTag))
 
-	// 3. Build using Docker daemon
-	cmd := exec.CommandContext(ctx, "docker", "build", "-t", localTag, contextDir)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker build failed: %w\noutput: %s", err, string(output))
+	// 3. Try to pull previous build image for cache
+	cacheFrom := g.pullCacheImage(ctx, templateID)
+
+	// 4. Build using Docker daemon with cache-from + streaming output
+	buildArgs := []string{"build"}
+	if cacheFrom != "" {
+		buildArgs = append(buildArgs, "--cache-from", cacheFrom)
+	}
+	buildArgs = append(buildArgs, "-t", localTag, contextDir)
+
+	cmd := exec.CommandContext(ctx, "docker", buildArgs...)
+	// Explicitly disable BuildKit — the API container only has docker-cli without buildx
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
+
+	if err := runCmdWithStreamingLogs(cmd, templateID, "docker build"); err != nil {
+		return fmt.Errorf("docker build failed: %w", err)
 	}
 
 	zap.L().Info("Docker build completed", zap.String("localTag", localTag))
 
-	// 4. Load built image from daemon
-	img, err := loadImageFromDaemon(ctx, localTag)
-	if err != nil {
-		return fmt.Errorf("failed to load built image from daemon: %w", err)
+	// 5. Tag and push to ECR using docker CLI
+	if err := g.tagAndPush(ctx, localTag, targetTag, templateID); err != nil {
+		return err
 	}
 
-	// 5. Push to ECR
-	auth, err := g.getAuthToken(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get ECR auth token: %w", err)
-	}
-
-	dst, err := name.ParseReference(targetTag)
-	if err != nil {
-		return fmt.Errorf("failed to parse target reference '%s': %w", targetTag, err)
-	}
-
-	if err := remote.Write(dst, img, remote.WithAuth(auth)); err != nil {
-		return fmt.Errorf("failed to push image to '%s': %w", targetTag, err)
-	}
-
-	// 6. Clean up local image
-	cleanupLocalImage(localTag)
+	// 6. Clean up old local images for this template, keep the latest
+	cleanupOldImages(templateID, localTag)
 
 	zap.L().Info("Successfully built and pushed Docker image",
 		zap.String("templateID", templateID),
@@ -221,51 +238,195 @@ func (g *AWSArtifactsRegistry) BuildAndPushImage(
 	return nil
 }
 
-// loadImageFromDaemon loads an image from the Docker daemon.
-// It first tries the daemon package, then falls back to saving and loading via tarball.
-func loadImageFromDaemon(ctx context.Context, tag string) (containerregistry.Image, error) {
-	ref, err := name.NewTag(tag)
+// pullCacheImage attempts to pull the latest image for a template from ECR
+// to use as Docker build cache. Returns the image tag on success, empty string on failure.
+func (g *AWSArtifactsRegistry) pullCacheImage(ctx context.Context, templateID string) string {
+	latestTag, err := g.getLatestImageTag(ctx, templateID)
+	if err != nil || latestTag == "" {
+		zap.L().Debug("No previous image found for cache",
+			zap.String("templateID", templateID), zap.Error(err))
+		return ""
+	}
+
+	// Check if the image already exists locally
+	checkCmd := exec.CommandContext(ctx, "docker", "image", "inspect", latestTag)
+	if checkCmd.Run() == nil {
+		zap.L().Info("Cache image already exists locally", zap.String("tag", latestTag))
+		return latestTag
+	}
+
+	// Write temporary Docker config with ECR credentials for pull
+	auth, err := g.getAuthToken(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse image tag '%s': %w", tag, err)
+		zap.L().Warn("Failed to get ECR auth for cache pull", zap.Error(err))
+		return ""
 	}
 
-	img, err := daemon.Image(ref)
-	if err == nil {
-		return img, nil
-	}
-
-	zap.L().Warn("Failed to load image from daemon directly, falling back to tarball",
-		zap.String("tag", tag), zap.Error(err))
-
-	// Fallback: save to tarball and load
-	tmpFile, err := os.CreateTemp("", "docker-image-*.tar")
+	configDir, err := writeTempDockerConfig(templateID, auth, latestTag)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file for image export: %w", err)
+		zap.L().Warn("Failed to write temp docker config", zap.Error(err))
+		return ""
 	}
-	defer os.Remove(tmpFile.Name())
-	tmpFile.Close()
+	defer os.RemoveAll(configDir)
 
-	cmd := exec.CommandContext(ctx, "docker", "save", "-o", tmpFile.Name(), tag)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("docker save failed: %w\noutput: %s", err, string(output))
+	zap.L().Info("Pulling cache image from ECR", zap.String("tag", latestTag))
+	pullCmd := exec.CommandContext(ctx, "docker", "--config", configDir, "pull", latestTag)
+	if output, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
+		zap.L().Warn("Failed to pull cache image, building without cache",
+			zap.String("tag", latestTag),
+			zap.Error(pullErr),
+			zap.String("output", string(output)))
+		return ""
 	}
 
-	img, err = tarball.ImageFromPath(tmpFile.Name(), &ref)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load image from tarball: %w", err)
-	}
-
-	return img, nil
+	zap.L().Info("Pulled cache image successfully", zap.String("tag", latestTag))
+	return latestTag
 }
 
-// cleanupLocalImage removes a local Docker image.
-func cleanupLocalImage(tag string) {
-	cmd := exec.Command("docker", "rmi", tag)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		zap.L().Warn("Failed to remove local Docker image",
-			zap.String("tag", tag),
-			zap.Error(err),
-			zap.String("output", string(output)))
+// writeTempDockerConfig creates a temporary Docker config directory with ECR credentials.
+// Returns the config directory path. Caller must clean up.
+func writeTempDockerConfig(templateID string, auth *authn.Basic, imageRef string) (string, error) {
+	configDir, err := os.MkdirTemp("", fmt.Sprintf("docker-cfg-%s-*", templateID))
+	if err != nil {
+		return "", err
+	}
+
+	// Extract registry host from image reference
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		os.RemoveAll(configDir)
+		return "", err
+	}
+	registryHost := ref.Context().RegistryStr()
+
+	configData := map[string]interface{}{
+		"auths": map[string]interface{}{
+			registryHost: map[string]string{
+				"username": auth.Username,
+				"password": auth.Password,
+			},
+		},
+	}
+
+	data, err := json.Marshal(configData)
+	if err != nil {
+		os.RemoveAll(configDir)
+		return "", err
+	}
+
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), data, 0600); err != nil {
+		os.RemoveAll(configDir)
+		return "", err
+	}
+
+	return configDir, nil
+}
+
+// tagAndPush tags the local image and pushes it to ECR using docker CLI.
+func (g *AWSArtifactsRegistry) tagAndPush(ctx context.Context, localTag, targetTag, templateID string) error {
+	// Tag
+	tagCmd := exec.CommandContext(ctx, "docker", "tag", localTag, targetTag)
+	if output, err := tagCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker tag failed: %w\noutput: %s", err, string(output))
+	}
+
+	// Login to ECR
+	auth, err := g.getAuthToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get ECR auth token for push: %w", err)
+	}
+
+	ref, err := name.ParseReference(targetTag)
+	if err != nil {
+		return fmt.Errorf("failed to parse target reference '%s': %w", targetTag, err)
+	}
+	registryHost := ref.Context().RegistryStr()
+
+	loginCmd := exec.CommandContext(ctx, "docker", "login",
+		"--username", auth.Username, "--password-stdin", registryHost)
+	loginCmd.Stdin = strings.NewReader(auth.Password)
+	if output, err := loginCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker login failed: %w\noutput: %s", err, string(output))
+	}
+
+	// Push with streaming logs
+	zap.L().Info("Pushing image to ECR", zap.String("targetTag", targetTag))
+	pushCmd := exec.CommandContext(ctx, "docker", "push", targetTag)
+	if err := runCmdWithStreamingLogs(pushCmd, templateID, "docker push"); err != nil {
+		return fmt.Errorf("docker push failed: %w", err)
+	}
+
+	zap.L().Info("Image pushed to ECR successfully", zap.String("targetTag", targetTag))
+	return nil
+}
+
+// runCmdWithStreamingLogs runs a command and streams its stdout/stderr to zap logger.
+// On failure, the error includes the last lines of output for diagnostics.
+func runCmdWithStreamingLogs(cmd *exec.Cmd, templateID, cmdName string) error {
+	// Use io.Pipe to merge stdout and stderr into a single reader
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return fmt.Errorf("%s start failed: %w", cmdName, err)
+	}
+
+	// Keep last N lines for error reporting
+	const tailSize = 30
+	tailLines := make([]string, 0, tailSize)
+
+	scanner := bufio.NewScanner(pr)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	// Read output in a goroutine since we need to close the writer after Wait()
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		for scanner.Scan() {
+			line := scanner.Text()
+			zap.L().Info(cmdName,
+				zap.String("templateID", templateID),
+				zap.String("output", line))
+			if len(tailLines) >= tailSize {
+				tailLines = tailLines[1:]
+			}
+			tailLines = append(tailLines, line)
+		}
+	}()
+
+	err := cmd.Wait()
+	pw.Close() // signal EOF to scanner
+	<-scanDone // wait for scanner to finish
+
+	if err != nil {
+		tail := strings.Join(tailLines, "\n")
+		return fmt.Errorf("%s: %w\noutput (last %d lines):\n%s", cmdName, err, len(tailLines), tail)
+	}
+
+	return nil
+}
+
+// cleanupOldImages removes old Docker images for a template, keeping the latest one.
+func cleanupOldImages(templateID, keepTag string) {
+	repoFilter := fmt.Sprintf("e2b-build/%s", templateID)
+	cmd := exec.Command("docker", "images", "--format", "{{.Repository}}:{{.Tag}}", repoFilter)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return
+	}
+
+	for _, tag := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if tag != "" && tag != keepTag {
+			rmiCmd := exec.Command("docker", "rmi", tag)
+			if rmiOut, rmiErr := rmiCmd.CombinedOutput(); rmiErr != nil {
+				zap.L().Warn("Failed to remove old Docker image",
+					zap.String("tag", tag),
+					zap.Error(rmiErr),
+					zap.String("output", string(rmiOut)))
+			}
+		}
 	}
 }
 
